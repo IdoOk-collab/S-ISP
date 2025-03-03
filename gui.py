@@ -1,45 +1,37 @@
 """
 Simple ISP Tuning Tool - GUI Module
-A PyQt5-based graphical interface for real-time image processing. Provides controls for
-adjusting histogram gain, Gaussian blur, and Fourier filtering, displaying original and
-processed images with histograms and optional frequency domain views.
+A PyQt5-based graphical interface for real-time image processing with modular settings.
 
 Author: Ido Okashi
 Date: February 24, 2025
 """
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QPushButton,
-    QSlider, QSpinBox, QVBoxLayout, QWidget, QSizePolicy, QScrollArea, QGroupBox
+    QSlider, QSpinBox, QVBoxLayout, QWidget, QSizePolicy, QScrollArea, QGroupBox, QStatusBar, QMessageBox
 )
 import cv2
-from isp_processing import convert_cv_qt, generate_histogram, compute_frequency_image, apply_fourier_filter
+import json
+import os
+from isp_processing import convert_cv_qt, generate_histogram, compute_frequency_image, apply_fourier_filter, apply_sharpening, adjust_rgb_gain, apply_lens_shading, adjust_white_balance, apply_noise_reduction, apply_gamma_correction
 
 class NoScrollSlider(QSlider):
-    """A QSlider subclass that disables mouse wheel interaction to prevent unintended changes."""
     def wheelEvent(self, event):
-        """Ignore mouse wheel events, passing them to the parent scroll area."""
         event.ignore()
 
 class ImageDisplayWindow(QWidget):
-    """A window displaying original and processed images with their histograms."""
     def __init__(self, original_image, processed_image):
-        """Initialize the image comparison window.
-
-        Args:
-            original_image (np.ndarray): The original image in BGR format.
-            processed_image (np.ndarray): The processed image in BGR format.
-        """
         super().__init__()
         self.setWindowTitle("Image Comparison")
         self.setWindowState(Qt.WindowMaximized)
 
+        print("Initializing ImageDisplayWindow")  # Debugging
+        
         self.orig_pixmap = convert_cv_qt(original_image)
         self.proc_pixmap = convert_cv_qt(processed_image)
 
-        # Setup image and histogram labels
         self.orig_label = QLabel(self, alignment=Qt.AlignCenter, sizePolicy=QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding))
         self.proc_label = QLabel(self, alignment=Qt.AlignCenter, sizePolicy=QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding))
         self.orig_hist_label = QLabel(self, alignment=Qt.AlignCenter, sizePolicy=QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed))
@@ -47,93 +39,154 @@ class ImageDisplayWindow(QWidget):
         
         self.orig_hist_label.setFixedHeight(150)
         self.proc_hist_label.setFixedHeight(150)
-
         self.orig_hist_label.setPixmap(generate_histogram(original_image))
         self.proc_hist_label.setPixmap(generate_histogram(processed_image))
 
-        # Layout for original image and histogram
         orig_layout = QVBoxLayout()
         orig_layout.addWidget(self.orig_label)
         orig_layout.addWidget(self.orig_hist_label)
 
-        # Layout for processed image and histogram
         proc_layout = QVBoxLayout()
         proc_layout.addWidget(self.proc_label)
         proc_layout.addWidget(self.proc_hist_label)
 
-        # Main side-by-side layout
         main_layout = QHBoxLayout()
         main_layout.addLayout(orig_layout)
         main_layout.addLayout(proc_layout)
         self.setLayout(main_layout)
 
-        self.resizeEvent(None)  # Trigger initial scaling
+        self.resizeEvent(None)
 
     def resizeEvent(self, event):
-        """Scale displayed images when the window is resized.
-
-        Args:
-            event (QResizeEvent): The resize event object (unused, can be None for initial call).
-        """
         if hasattr(self, 'orig_pixmap'):
-            available_height = self.height() - 200  # Account for histogram height
-            available_width = self.width() // 2 - 20  # Split width, with padding
+            available_height = self.height() - 200
+            available_width = self.width() // 2 - 20
             for label, pixmap in [(self.orig_label, self.orig_pixmap), (self.proc_label, self.proc_pixmap)]:
                 label.setPixmap(pixmap.scaled(available_width, available_height, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
 class MainWindow(QMainWindow):
-    """Main application window with image processing controls and display."""
     def __init__(self):
-        """Initialize the main window with controls and layout."""
         super().__init__()
         self.setWindowTitle("Ido Okashi - Simple ISP")
         self.setWindowState(Qt.WindowMaximized)
 
-        # Central widget with scrollable content
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         scroll_area = QScrollArea(widgetResizable=True)
         scroll_widget = QWidget()
-        scroll_layout = QVBoxLayout(scroll_widget)
+        self.scroll_layout = QVBoxLayout(scroll_widget)
         scroll_area.setWidget(scroll_widget)
         QVBoxLayout(central_widget).addWidget(scroll_area)
 
-        # Load image button
         self.load_button = QPushButton("Load Image")
         self.load_button.setFixedSize(150, 50)
         self.load_button.clicked.connect(self.load_image)
+        self.save_preset_button = QPushButton("Save Preset")
+        self.save_preset_button.setFixedSize(150, 50)
+        self.save_preset_button.clicked.connect(self.save_preset)
+        self.load_preset_button = QPushButton("Load Preset")
+        self.load_preset_button.setFixedSize(150, 50)
+        self.load_preset_button.clicked.connect(self.load_preset)
+        
         top_layout = QHBoxLayout()
         top_layout.addStretch()
         top_layout.addWidget(self.load_button)
+        top_layout.addWidget(self.save_preset_button)
+        top_layout.addWidget(self.load_preset_button)
         top_layout.addStretch()
-        scroll_layout.addLayout(top_layout)
+        self.scroll_layout.addLayout(top_layout)
 
-        # Basic adjustments group
-        self.basic_group = QGroupBox("Basic Adjustments")
-        self.fourier_group = QGroupBox("Fourier Settings")
-        for group in [self.basic_group, self.fourier_group]:
+        self.settings = {
+            "Basic Adjustments": [
+                {"type": "slider", "name": "histogram_slider", "label": "Histogram Gain", "min": -100, "max": 100, 
+                 "process": lambda img, val: cv2.convertScaleAbs(img, alpha=1 + val / 100.0), 
+                 "tooltip": "Adjusts overall image brightness and contrast"},
+                {"type": "slider", "name": "blur_slider", "label": "Gaussian Blur", "min": 0, "max": 50, 
+                 "process": lambda img, val: cv2.GaussianBlur(img, (self.controls["kernel_size_selector"].value() | 1, self.controls["kernel_size_selector"].value() | 1), val * 0.05) if val > 0 else img, 
+                 "tooltip": "Smooths the image to reduce noise or detail"},
+                {"type": "spinbox", "name": "kernel_size_selector", "label": "Kernel Size", "min": 1, "max": 51, "step": 2, "default": 3, 
+                 "tooltip": "Sets the size of the blur kernel"}
+            ],
+            "Fourier Settings": [
+                {"type": "checkbox", "name": "fourier_checkbox", "label": "Apply Fourier Filter", 
+                 "process": lambda img, val: apply_fourier_filter(img, self.controls["fourier_inner_slider"].value(), self.controls["fourier_outer_slider"].value()) if val else img, 
+                 "tooltip": "Enables frequency domain filtering"},
+                {"type": "slider", "name": "fourier_inner_slider", "label": "Fourier Inner Cutoff", "min": 0, "max": 100, 
+                 "tooltip": "Sets the inner frequency cutoff for filtering"},
+                {"type": "slider", "name": "fourier_outer_slider", "label": "Fourier Outer Cutoff", "min": 0, "max": 100, 
+                 "tooltip": "Sets the outer frequency cutoff for filtering"}
+            ],
+            "RGB Gain Control": [
+                {"type": "slider", "name": "red_gain_slider", "label": "Red Gain", "min": 0, "max": 200, "default": 100,
+                 "process": lambda img, val: adjust_rgb_gain(img, val / 100.0, 'R'), 
+                 "tooltip": "Adjusts red channel intensity"},
+                {"type": "slider", "name": "green_gain_slider", "label": "Green Gain", "min": 0, "max": 200, "default": 100,
+                 "process": lambda img, val: adjust_rgb_gain(img, val / 100.0, 'G'), 
+                 "tooltip": "Adjusts green channel intensity"},
+                {"type": "slider", "name": "blue_gain_slider", "label": "Blue Gain", "min": 0, "max": 200, "default": 100,
+                 "process": lambda img, val: adjust_rgb_gain(img, val / 100.0, 'B'), 
+                 "tooltip": "Adjusts blue channel intensity"}
+            ],
+            "White Balance": [
+                {"type": "slider", "name": "temperature_slider", "label": "Temperature", "min": -100, "max": 100, 
+                 "process": lambda img, val: adjust_white_balance(img, val / 100.0, self.controls["tint_slider"].value() / 100.0), 
+                 "tooltip": "Adjusts color temperature (cool to warm)"},
+                {"type": "slider", "name": "tint_slider", "label": "Tint", "min": -100, "max": 100, 
+                 "process": lambda img, val: adjust_white_balance(img, self.controls["temperature_slider"].value() / 100.0, val / 100.0), 
+                 "tooltip": "Adjusts tint (magenta to green)"}
+            ],
+            "Noise Reduction": [
+                {"type": "slider", "name": "noise_reduction_slider", "label": "Noise Reduction Strength", "min": 0, "max": 100, 
+                 "process": lambda img, val: apply_noise_reduction(val / 100.0, img), 
+                 "tooltip": "Reduces image noise while preserving edges"}
+            ],
+            "Gamma Correction": [
+                {"type": "slider", "name": "gamma_slider", "label": "Gamma", "min": 10, "max": 500, "default": 100,
+                 "process": lambda img, val: apply_gamma_correction(val / 100.0, img), 
+                 "tooltip": "Adjusts brightness/contrast non-linearly (0.1 darkens, >1 brightens)"}
+            ],
+            "Lens Shading Correction": [
+                {"type": "slider", "name": "lens_shading_slider", "label": "Lens Shading Strength", "min": -100, "max": 100, 
+                 "process": lambda img, val: apply_lens_shading(val / 100.0, img), 
+                 "tooltip": "Adjusts edge intensity (darken or brighten)"}
+            ],
+            "Sharpening Settings": [
+                {"type": "slider", "name": "sharpening_slider", "label": "Sharpening Strength", "min": 0, "max": 100, 
+                 "process": lambda img, val: apply_sharpening(val, img) if val > 0 else img, 
+                 "tooltip": "Enhances image edges and details"}
+            ]
+        }
+
+        self.groups = {}
+        self.controls = {}
+        for group_name, controls in self.settings.items():
+            group = QGroupBox(group_name)
             group.setStyleSheet("QGroupBox::title { font-weight: bold; }")
-            scroll_layout.addWidget(group)
+            layout = QVBoxLayout(group)
+            for control in controls:
+                if control["type"] == "slider":
+                    initial_value = control.get("default", 0)
+                    widget = self.add_slider(layout, control["label"], control["min"], control["max"], initial_value=initial_value)
+                    widget.setToolTip(control.get("tooltip", ""))
+                elif control["type"] == "spinbox":
+                    widget = QSpinBox(minimum=control["min"], maximum=control["max"], singleStep=control["step"], value=control["default"], enabled=False)
+                    widget.setFixedWidth(60)
+                    widget.setToolTip(control.get("tooltip", ""))
+                    spin_layout = QHBoxLayout()
+                    spin_layout.addWidget(QLabel(control["label"]))
+                    spin_layout.addWidget(widget)
+                    spin_layout.addStretch()
+                    layout.addLayout(spin_layout)
+                    widget.valueChanged.connect(self.queue_processing)
+                elif control["type"] == "checkbox":
+                    widget = QCheckBox(control["label"], enabled=False)
+                    widget.stateChanged.connect(self.queue_processing)
+                    widget.setToolTip(control.get("tooltip", ""))
+                    layout.addWidget(widget)
+                self.controls[control["name"]] = widget
+            self.groups[group_name] = group
+            self.scroll_layout.addWidget(group)
 
-        basic_layout = QVBoxLayout(self.basic_group)
-        self.histogram_slider = self.add_slider(basic_layout, "Histogram Gain", -100, 100)
-        self.blur_slider = self.add_slider(basic_layout, "Gaussian Blur", 0, 50)
-        self.kernel_size_selector = QSpinBox(minimum=1, maximum=51, singleStep=2, value=3, enabled=False)
-        self.kernel_size_selector.setFixedWidth(60)
-        kernel_layout = QHBoxLayout()
-        kernel_layout.addWidget(QLabel("Kernel Size"))
-        kernel_layout.addWidget(self.kernel_size_selector)
-        kernel_layout.addStretch()
-        basic_layout.addLayout(kernel_layout)
-
-        # Fourier settings group
-        fourier_layout = QVBoxLayout(self.fourier_group)
-        self.fourier_checkbox = QCheckBox("Apply Fourier Filter", enabled=False, stateChanged=self.apply_processing)
-        fourier_layout.addWidget(self.fourier_checkbox)
-        self.fourier_inner_slider = self.add_slider(fourier_layout, "Fourier Inner Cutoff", 0, 100)
-        self.fourier_outer_slider = self.add_slider(fourier_layout, "Fourier Outer Cutoff", 0, 100)
-
-        # Frequency display layout (added dynamically)
         self.freq_layout = QHBoxLayout()
         self.original_freq_vbox = QVBoxLayout()
         self.processed_freq_vbox = QVBoxLayout()
@@ -151,130 +204,185 @@ class MainWindow(QMainWindow):
         self.freq_layout.addLayout(self.original_freq_vbox)
         self.freq_layout.addLayout(self.processed_freq_vbox)
 
-        # Connect control signals
-        for widget in [self.histogram_slider, self.blur_slider, self.kernel_size_selector, self.fourier_inner_slider, self.fourier_outer_slider]:
-            widget.valueChanged.connect(self.apply_processing)
-
-        # Initialize image storage
         self.original_image = None
         self.processed_image = None
         self.image_window = None
         self.freq_layout_added = False
+        self.original_freq_cache = None
+        self.current_image_path = None
 
-        scroll_layout.addStretch()  # Keep content compact at the top
+        # Debounce timer
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.apply_processing)
 
-    def add_slider(self, layout, text, min_val, max_val):
-        """Add a slider with label and value display to a layout.
+        # Status bar for performance metrics
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
 
-        Args:
-            layout (QVBoxLayout): The layout to add the slider to.
-            text (str): Label text for the slider.
-            min_val (int): Minimum value of the slider.
-            max_val (int): Maximum value of the slider.
+        self.scroll_layout.addStretch()
 
-        Returns:
-            NoScrollSlider: The created slider widget.
-        """
+    def add_slider(self, layout, text, min_val, max_val, initial_value=0, enabled=False):
         slider_layout = QVBoxLayout()
         slider_layout.addWidget(QLabel(text))
-        slider = NoScrollSlider(Qt.Horizontal, minimum=min_val, maximum=max_val, enabled=False)
+        slider = NoScrollSlider(Qt.Horizontal, minimum=min_val, maximum=max_val, enabled=enabled)
+        slider.setValue(initial_value)
         value_label = QLabel(str(slider.value()))
         slider.valueChanged.connect(lambda v: value_label.setText(str(v)))
+        slider.valueChanged.connect(self.queue_processing)
         slider_layout.addWidget(slider)
         slider_layout.addWidget(value_label)
         layout.addLayout(slider_layout)
         return slider
 
-    def resizeEvent(self, event):
-        """Resize frequency domain images if visible when the window size changes.
+    def queue_processing(self):
+        """Queue processing with a debounce delay."""
+        self.timer.start(5)  # 50ms debounce delay
 
-        Args:
-            event (QResizeEvent): The resize event object.
-        """
+    def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.fourier_checkbox.isChecked() and self.freq_layout_added:
+        if self.controls["fourier_checkbox"].isChecked() and self.freq_layout_added:
             for label in [self.original_freq_label, self.processed_freq_label]:
                 if label.pixmap() and not label.pixmap().isNull():
                     label.setPixmap(self.scale_frequency_image(label.pixmap()))
 
     def scale_frequency_image(self, pixmap):
-        """Scale frequency domain images to fit the window.
-
-        Args:
-            pixmap (QPixmap): The pixmap to scale.
-
-        Returns:
-            QPixmap: The scaled pixmap.
-        """
-        return pixmap.scaled(self.width() // 2 - 20, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        available_width = self.width() // 2 - 20
+        available_height = self.height() - 200
+        size = min(available_width, available_height)
+        return pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
     def load_image(self):
-        """Load an image file and enable processing controls."""
         fname, _ = QFileDialog.getOpenFileName(self, "Open Image File", "", "Image files (*.jpg *.png *.bmp)")
         if fname:
             self.original_image = cv2.imread(fname)
+            if self.original_image is None:
+                self.status_bar.showMessage("Failed to load image.", 3000)
+                return
+            self.current_image_path = fname
             self.processed_image = self.original_image.copy()
-            for widget in [self.histogram_slider, self.blur_slider, self.kernel_size_selector,
-                           self.fourier_checkbox, self.fourier_inner_slider, self.fourier_outer_slider]:
+            for widget in self.controls.values():
                 widget.setEnabled(True)
+            self.original_freq_cache = compute_frequency_image(self.original_image)
             self.apply_processing()
-            self.image_window = ImageDisplayWindow(self.original_image, self.processed_image)
+            if self.image_window is None:
+                print("Creating new ImageDisplayWindow")
+                self.image_window = ImageDisplayWindow(self.original_image, self.processed_image)
+            else:
+                print("Reusing existing ImageDisplayWindow")
+                self.image_window.orig_pixmap = convert_cv_qt(self.original_image)
+                self.image_window.proc_pixmap = convert_cv_qt(self.processed_image)
+                self.image_window.resizeEvent(None)
             self.image_window.show()
+            self.image_window.raise_()
+            self.image_window.activateWindow()
+
+    def save_preset(self):
+        if self.original_image is None:
+            self.status_bar.showMessage("No image loaded to save preset for.", 3000)
+            return
+        
+        base_name = os.path.splitext(os.path.basename(self.current_image_path))[0]
+        preset_dir = os.path.dirname(self.current_image_path)
+        preset_name = f"{base_name}.json"
+        counter = 2
+        
+        while os.path.exists(os.path.join(preset_dir, preset_name)):
+            preset_name = f"{base_name}{counter}.json"
+            counter += 1
+        
+        preset_path = os.path.join(preset_dir, preset_name)
+        preset = {name: widget.value() if isinstance(widget, (QSlider, QSpinBox)) else widget.isChecked() 
+                  for name, widget in self.controls.items()}
+        with open(preset_path, 'w') as f:
+            json.dump(preset, f)
+        
+        # Show pop-up notification with auto-close
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Preset Saved")
+        msg.setText(f"Presets Saved Successfully!\nFile: {preset_path}")
+        msg.setStandardButtons(QMessageBox.NoButton)
+        
+        close_timer = QTimer(self)
+        close_timer.setSingleShot(True)
+        close_timer.timeout.connect(msg.accept)
+        close_timer.start(4000)  # 4000 ms = 4 seconds
+        
+        print("Showing QMessageBox")
+        msg.exec_()
+        print("QMessageBox should have closed")
+
+    def load_preset(self):
+        if self.original_image is None:
+            self.status_bar.showMessage("Load an image before applying a preset.", 3000)
+            return
+        fname, _ = QFileDialog.getOpenFileName(self, "Load Preset", "", "JSON files (*.json)")
+        if fname and os.path.exists(fname):
+            with open(fname, 'r') as f:
+                preset = json.load(f)
+            for name, value in preset.items():
+                if name in self.controls:
+                    widget = self.controls[name]
+                    if isinstance(widget, QSlider) or isinstance(widget, QSpinBox):
+                        widget.setValue(value)
+                    elif isinstance(widget, QCheckBox):
+                        widget.setChecked(value)
+            self.apply_processing()
+            self.status_bar.showMessage(f"Preset loaded from {fname}", 3000)
 
     def apply_processing(self):
-        """Apply image processing based on current control values."""
+        import time
+        start_time = time.time()
+        
         if self.original_image is None:
             return
         self.processed_image = self.original_image.copy()
-        
-        # Apply histogram gain
-        alpha = 1 + self.histogram_slider.value() / 100.0
-        self.processed_image = cv2.convertScaleAbs(self.processed_image, alpha=alpha)
 
-        # Apply Gaussian blur if enabled
-        if self.blur_slider.value() > 0:
-            kernel_size = self.kernel_size_selector.value() | 1  # Ensure odd kernel size
-            self.processed_image = cv2.GaussianBlur(self.processed_image, (kernel_size, kernel_size), self.blur_slider.value() * 0.05)
+        for group_name, controls in self.settings.items():
+            for control in controls:
+                if "process" in control:
+                    widget = self.controls[control["name"]]
+                    value = widget.isChecked() if control["type"] == "checkbox" else widget.value()
+                    self.processed_image = control["process"](self.processed_image, value)
 
-        # Handle Fourier filter and frequency display
-        fourier_layout = self.fourier_group.layout()
-        if self.fourier_checkbox.isChecked():
-            self.processed_image = apply_fourier_filter(self.processed_image,
-                                                        self.fourier_inner_slider.value(),
-                                                        self.fourier_outer_slider.value())
+        if self.controls["fourier_checkbox"].isChecked():
+            inner = self.controls["fourier_inner_slider"].value()
+            outer = self.controls["fourier_outer_slider"].value()
             if not self.freq_layout_added:
-                fourier_layout.addLayout(self.freq_layout)
+                self.groups["Fourier Settings"].layout().addLayout(self.freq_layout)
                 self.freq_layout_added = True
-            orig_freq = compute_frequency_image(self.original_image)  # Original spectrum
-            proc_freq = compute_frequency_image(self.processed_image, 
-                                                inner=self.fourier_inner_slider.value(), 
-                                                outer=self.fourier_outer_slider.value())  # Spectrum + mask
-            self.original_freq_label.setPixmap(convert_cv_qt(orig_freq))
-            self.processed_freq_label.setPixmap(convert_cv_qt(proc_freq))
+            
+            orig_freq = self.original_freq_cache
+            proc_freq = compute_frequency_image(self.processed_image, inner=inner, outer=outer)
+            display_size = 500
+            orig_pixmap = convert_cv_qt(orig_freq).scaled(display_size, display_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            proc_pixmap = convert_cv_qt(proc_freq).scaled(display_size, display_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            
+            self.original_freq_label.setPixmap(orig_pixmap)
+            self.processed_freq_label.setPixmap(proc_pixmap)
             self.original_freq_title.setVisible(True)
             self.processed_freq_title.setVisible(True)
             self.original_freq_label.setVisible(True)
             self.processed_freq_label.setVisible(True)
-            # Ensure sliders are enabled when filter is active
-            self.fourier_inner_slider.setEnabled(True)
-            self.fourier_outer_slider.setEnabled(True)
+            self.controls["fourier_inner_slider"].setEnabled(True)
+            self.controls["fourier_outer_slider"].setEnabled(True)
         else:
             if self.freq_layout_added:
-                fourier_layout.removeItem(self.freq_layout)
+                self.groups["Fourier Settings"].layout().removeItem(self.freq_layout)
                 self.original_freq_title.setVisible(False)
                 self.processed_freq_title.setVisible(False)
                 self.original_freq_label.setVisible(False)
                 self.processed_freq_label.setVisible(False)
                 self.freq_layout_added = False
-            # Disable and reset frequency sliders when filter is off
-            self.fourier_inner_slider.setEnabled(False)
-            self.fourier_inner_slider.setValue(0)  # Reset to minimum
-            self.fourier_outer_slider.setEnabled(False)
-            self.fourier_outer_slider.setValue(0)  # Reset to minimum
-            self.fourier_group.update()
+            self.controls["fourier_inner_slider"].setValue(0)
+            self.controls["fourier_outer_slider"].setValue(0)
+            self.controls["fourier_inner_slider"].setEnabled(False)
+            self.controls["fourier_outer_slider"].setEnabled(False)
 
-        # Update the display window if open
         if self.image_window:
             self.image_window.proc_pixmap = convert_cv_qt(self.processed_image)
             self.image_window.resizeEvent(None)
             self.image_window.proc_hist_label.setPixmap(generate_histogram(self.processed_image))
+        
+        elapsed = (time.time() - start_time) * 1000  # ms
+        self.status_bar.showMessage(f"Processing time: {elapsed:.1f} ms")
