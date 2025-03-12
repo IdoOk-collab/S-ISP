@@ -12,13 +12,13 @@ import cv2
 import numpy as np
 from PyQt5.QtGui import QImage, QPixmap
 
-def resize_image_1080p(img):
+def resize_image_720p(img):
     if img is None or img.size == 0:
         raise ValueError("Input image is empty or invalid")
         
     h, w = img.shape[:2]
-    if h > 1080:  # Downscale if height exceeds 1080
-        scale = 1080 / h
+    if h > 720:  # Downscale if height exceeds 720
+        scale = 720 / h
         img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         h, w = img.shape[:2]
     return img, h, w 
@@ -33,12 +33,15 @@ def convert_cv_qt(cv_img):
         QPixmap: The converted image ready for Qt display in RGB format.
     """
     if cv_img is None or cv_img.size == 0:
-        raise ValueError("Cannot convert empty or invalid image to QPixmap")
-
-    rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
-    h, w, ch = rgb_image.shape
-    bytes_per_line = ch * w
-    return QPixmap.fromImage(QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888))
+        return QPixmap()
+        
+    h, w = cv_img.shape[:2]
+    if len(cv_img.shape) == 2:  # Grayscale
+        qimg = QImage(cv_img.data, w, h, w, QImage.Format_Grayscale8)
+    else:  # BGR
+        rgb_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb_img.data, w, h, w * 3, QImage.Format_RGB888)
+    return QPixmap.fromImage(qimg)
 
 def generate_histogram(image):
     """Generate a histogram visualization of an image as a QPixmap.
@@ -62,7 +65,7 @@ def compute_frequency_image(img, inner=None, outer=None):
     if img is None or img.size == 0:
         raise ValueError("Input image to compute_frequency_image is empty or invalid")
         
-    img, h, w = resize_image_1080p(img)
+    img, h, w = resize_image_720p(img)
     diagonal = int(np.ceil((w**2 + h**2)**0.5))
     pad_y, pad_x = (diagonal - h) // 2, (diagonal - w) // 2
     img_padded = cv2.copyMakeBorder(img, pad_y, diagonal - h - pad_y, pad_x, diagonal - w - pad_x, cv2.BORDER_REFLECT)
@@ -103,7 +106,7 @@ def apply_fourier_filter(img, inner, outer):
     if inner >= outer:  # Skip if invalid range
         return img
 
-    img, h, w = resize_image_1080p(img)
+    img, h, w = resize_image_720p(img)
     
     # Pad image to square with diagonal size for FFT
     diagonal = int(np.ceil((w**2 + h**2)**0.5))
@@ -251,3 +254,33 @@ def apply_gamma_correction(gamma, img):
     
     # Apply the lookup table to the image
     return cv2.LUT(img, table)
+    
+def apply_tone_mapping(strength, img):
+    """Apply simple tone mapping to simulate HDR adjustment."""
+    if strength <= 0:
+        return img.copy()
+    # Normalize to float32 for processing
+    img_float = img.astype(np.float32) / 255.0
+    # Logarithmic tone mapping
+    tone_mapped = np.log1p(img_float * strength) / np.log1p(strength)
+    return cv2.normalize(tone_mapped, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    
+def apply_edge_detection(img, low_threshold, high_threshold, apply=False):
+    """Apply Canny edge detection and compute edge density."""
+    if not apply:
+        return img.copy(), 0.0
+    edges = cv2.Canny(img, low_threshold, high_threshold)
+    edge_density = np.sum(edges > 0) / (img.shape[0] * img.shape[1])  # Proportion of edge pixels
+    img_with_edges = img.copy()
+    img_with_edges[edges != 0] = [255, 255, 255]  # White edges
+    return img_with_edges, edge_density
+
+def apply_orb_keypoints(img, max_keypoints, apply=False):
+    """Apply ORB keypoint detection and compute average strength."""
+    if not apply:
+        return img.copy(), 0, 0.0
+    orb = cv2.ORB_create(nfeatures=max_keypoints)
+    keypoints = orb.detect(img, None)
+    img_with_keypoints = cv2.drawKeypoints(img, keypoints, None, color=(0, 255, 0), flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    avg_strength = sum(kp.response for kp in keypoints) / len(keypoints) if keypoints else 0.0
+    return img_with_keypoints, len(keypoints), avg_strength

@@ -6,8 +6,8 @@ Author: Ido Okashi
 Date: February 24, 2025
 """
 
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QPixmap
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPoint
+from PyQt5.QtGui import QPixmap, QPainter, QPen
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QPushButton,
     QSlider, QSpinBox, QVBoxLayout, QWidget, QSizePolicy, QScrollArea, QGroupBox, QStatusBar, QMessageBox
@@ -15,25 +15,112 @@ from PyQt5.QtWidgets import (
 import cv2
 import json
 import os
-from isp_processing import convert_cv_qt, generate_histogram, compute_frequency_image, apply_fourier_filter, apply_sharpening, adjust_rgb_gain, apply_lens_shading, adjust_white_balance, apply_noise_reduction, apply_gamma_correction
+import numpy as np
+from isp_processing import convert_cv_qt, generate_histogram, compute_frequency_image, apply_fourier_filter, apply_sharpening, adjust_rgb_gain, apply_lens_shading, adjust_white_balance, apply_noise_reduction, apply_gamma_correction, apply_tone_mapping, apply_edge_detection, apply_orb_keypoints
 
 class NoScrollSlider(QSlider):
     def wheelEvent(self, event):
         event.ignore()
+
+class ProcessingThread(QThread):
+    result = pyqtSignal(object)
+
+    def __init__(self, parent, original_image, settings, controls):
+        super().__init__(parent)
+        self.original_image = original_image
+        self.settings = settings
+        self.controls = controls
+
+    def run(self):
+        import time
+        start_time = time.time()
+        if self.original_image is None:
+            return
+        processed_image = self.original_image.copy()
+        keypoint_count = 0
+        keypoint_strength = 0.0
+        edge_density = 0.0
+
+        for group_name, controls in self.settings.items():
+            for control in controls:
+                if "process" in control:
+                    widget = self.controls[control["name"]]
+                    value = widget.isChecked() if control["type"] == "checkbox" else widget.value()
+                    if control["name"] == "keypoints_checkbox":
+                        processed_image, keypoint_count, keypoint_strength = control["process"](processed_image, value)
+                    elif control["name"] == "edge_detection_checkbox":
+                        processed_image, edge_density = control["process"](processed_image, value)
+                    else:
+                        processed_image = control["process"](processed_image, value)
+
+        elapsed = (time.time() - start_time) * 1000
+        self.result.emit((processed_image, keypoint_count, keypoint_strength, edge_density, elapsed))
+
+class ClickableLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.crop_active = False
+        self.crop_pos = QPoint(0, 0)
+        self.crop_size = 100  # 100x100 crop
+        self.pixmap_base = None  # Base pixmap without rectangle
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.crop_active = True
+            self.crop_pos = event.pos()
+            self.update_crop()
+
+    def mouseMoveEvent(self, event):
+        if self.crop_active:
+            self.crop_pos = event.pos()
+            self.update_crop()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.crop_active = False
+            # Optionally keep the last crop visible or reset
+            self.update_crop()
+
+    def update_crop(self):
+        if not self.pixmap_base or self.pixmap_base.isNull():
+            return
+        pixmap = self.pixmap_base.copy()
+        painter = QPainter(pixmap)
+        pen = QPen(Qt.red, 2, Qt.SolidLine)
+        painter.setPen(pen)
+        x = self.crop_pos.x()
+        y = self.crop_pos.y()
+        half_size = self.crop_size // 2
+        rect_x = x - half_size
+        rect_y = y - half_size
+        painter.drawRect(rect_x, rect_y, self.crop_size, self.crop_size)
+        painter.end()
+        self.setPixmap(pixmap)
+
+        # Show zoomed crop in popup
+        if hasattr(self.parent(), 'show_zoom'):
+            self.parent().show_zoom(self, x, y)
 
 class ImageDisplayWindow(QWidget):
     def __init__(self, original_image, processed_image):
         super().__init__()
         self.setWindowTitle("Image Comparison")
         self.setWindowState(Qt.WindowMaximized)
-
-        print("Initializing ImageDisplayWindow")  # Debugging
+        
+        self.original_image = original_image
+        self.processed_image = processed_image
         
         self.orig_pixmap = convert_cv_qt(original_image)
         self.proc_pixmap = convert_cv_qt(processed_image)
 
-        self.orig_label = QLabel(self, alignment=Qt.AlignCenter, sizePolicy=QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding))
-        self.proc_label = QLabel(self, alignment=Qt.AlignCenter, sizePolicy=QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding))
+        self.orig_label = ClickableLabel(self)
+        self.orig_label.setAlignment(Qt.AlignCenter)
+        self.orig_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.proc_label = ClickableLabel(self)
+        self.proc_label.setAlignment(Qt.AlignCenter)
+        self.proc_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        
         self.orig_hist_label = QLabel(self, alignment=Qt.AlignCenter, sizePolicy=QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed))
         self.proc_hist_label = QLabel(self, alignment=Qt.AlignCenter, sizePolicy=QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed))
         
@@ -55,14 +142,62 @@ class ImageDisplayWindow(QWidget):
         main_layout.addLayout(proc_layout)
         self.setLayout(main_layout)
 
+        self.zoom_popup = None  # Track single popup
+
         self.resizeEvent(None)
 
     def resizeEvent(self, event):
         if hasattr(self, 'orig_pixmap'):
             available_height = self.height() - 200
             available_width = self.width() // 2 - 20
-            for label, pixmap in [(self.orig_label, self.orig_pixmap), (self.proc_label, self.proc_pixmap)]:
-                label.setPixmap(pixmap.scaled(available_width, available_height, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.orig_label.pixmap_base = self.orig_pixmap.scaled(available_width, available_height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.proc_label.pixmap_base = self.proc_pixmap.scaled(available_width, available_height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.orig_label.setPixmap(self.orig_label.pixmap_base)
+            self.proc_label.setPixmap(self.proc_label.pixmap_base)
+
+    def show_zoom(self, label, x, y):
+        # Convert label coordinates to image coordinates
+        if label == self.orig_label:
+            img = self.original_image
+            side = "Original"
+        else:
+            img = self.processed_image
+            side = "Processed"
+
+        img_w, img_h = img.shape[1], img.shape[0]
+        label_w, label_h = label.pixmap_base.width(), label.pixmap_base.height()
+        scale_x = img_w / label_w
+        scale_y = img_h / label_h
+        img_x = int(x * scale_x)
+        img_y = int(y * scale_y)
+
+        # Crop 100x100 region
+        crop_size = 50  # Half of 100x100
+        y_start = max(0, img_y - crop_size)
+        y_end = min(img_h, img_y + crop_size)
+        x_start = max(0, img_x - crop_size)
+        x_end = min(img_w, img_x + crop_size)
+        crop = img[y_start:y_end, x_start:x_end]
+
+        # Update or create popup
+        if self.zoom_popup is None or not self.zoom_popup.isVisible():
+            self.zoom_popup = QWidget()
+            self.zoom_popup.setWindowTitle(f"{side} Zoom")
+            self.zoom_popup.setFixedSize(200, 200)
+            self.zoom_label = QLabel(self.zoom_popup)
+            layout = QVBoxLayout(self.zoom_popup)
+            layout.addWidget(self.zoom_label)
+            self.zoom_popup.show()
+        else:
+            self.zoom_popup.setWindowTitle(f"{side} Zoom at ({img_x}, {img_y})")
+
+        zoom_pixmap = convert_cv_qt(crop).scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.zoom_label.setPixmap(zoom_pixmap)
+        self.zoom_label.setAlignment(Qt.AlignCenter)
+        
+        # Position popup next to mouse
+        global_pos = label.mapToGlobal(QPoint(x, y))
+        self.zoom_popup.move(global_pos + QPoint(10, 10))  # Slight offset
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -74,16 +209,20 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         scroll_area = QScrollArea(widgetResizable=True)
         scroll_widget = QWidget()
-        self.scroll_layout = QVBoxLayout(scroll_widget)
+        main_layout = QVBoxLayout(scroll_widget)
         scroll_area.setWidget(scroll_widget)
         QVBoxLayout(central_widget).addWidget(scroll_area)
 
+        # Top button layout
         self.load_button = QPushButton("Load Image")
         self.load_button.setFixedSize(150, 50)
         self.load_button.clicked.connect(self.load_image)
         self.save_preset_button = QPushButton("Save Preset")
         self.save_preset_button.setFixedSize(150, 50)
         self.save_preset_button.clicked.connect(self.save_preset)
+        self.save_image_button = QPushButton("Save Image")
+        self.save_image_button.setFixedSize(150, 50)
+        self.save_image_button.clicked.connect(self.save_image)
         self.load_preset_button = QPushButton("Load Preset")
         self.load_preset_button.setFixedSize(150, 50)
         self.load_preset_button.clicked.connect(self.load_preset)
@@ -92,10 +231,20 @@ class MainWindow(QMainWindow):
         top_layout.addStretch()
         top_layout.addWidget(self.load_button)
         top_layout.addWidget(self.save_preset_button)
+        top_layout.addWidget(self.save_image_button)
         top_layout.addWidget(self.load_preset_button)
         top_layout.addStretch()
-        self.scroll_layout.addLayout(top_layout)
+        main_layout.addLayout(top_layout)
 
+        # Two-column layout for group boxes
+        columns_layout = QHBoxLayout()
+        left_column = QVBoxLayout()
+        right_column = QVBoxLayout()
+        columns_layout.addLayout(left_column)
+        columns_layout.addLayout(right_column)
+        main_layout.addLayout(columns_layout)
+
+        # Define settings
         self.settings = {
             "Basic Adjustments": [
                 {"type": "slider", "name": "histogram_slider", "label": "Histogram Gain", "min": -100, "max": 100, 
@@ -154,15 +303,52 @@ class MainWindow(QMainWindow):
                 {"type": "slider", "name": "sharpening_slider", "label": "Sharpening Strength", "min": 0, "max": 100, 
                  "process": lambda img, val: apply_sharpening(val, img) if val > 0 else img, 
                  "tooltip": "Enhances image edges and details"}
+            ],
+            "Tone Mapping": [
+                {"type": "slider", "name": "tone_mapping_slider", "label": "Tone Mapping Strength", "min": 0, "max": 100,
+                 "process": lambda img, val: apply_tone_mapping(val / 10.0, img),
+                 "tooltip": "Simulates HDR by compressing dynamic range"}
+            ],
+            "Feature Extraction": [
+                {"type": "checkbox", "name": "edge_detection_checkbox", "label": "Show Edges", 
+                 "process": lambda img, val: apply_edge_detection(img, self.controls["edge_low_slider"].value(), self.controls["edge_high_slider"].value(), val), 
+                 "tooltip": "Overlays Canny edges to highlight structure"},
+                {"type": "slider", "name": "edge_low_slider", "label": "Edge Low Threshold", "min": 0, "max": 255, "default": 50,
+                 "tooltip": "Lower threshold for edge detection sensitivity"},
+                {"type": "slider", "name": "edge_high_slider", "label": "Edge High Threshold", "min": 0, "max": 255, "default": 150,
+                 "tooltip": "Upper threshold for edge detection strength"},
+                {"type": "checkbox", "name": "keypoints_checkbox", "label": "Show Keypoints", 
+                 "process": lambda img, val: apply_orb_keypoints(img, self.controls["keypoints_slider"].value(), val), 
+                 "tooltip": "Overlays ORB keypoints to highlight distinctive features"},
+                {"type": "slider", "name": "keypoints_slider", "label": "Max Keypoints", "min": 100, "max": 1000, "default": 500,
+                 "tooltip": "Controls the maximum number of keypoints detected"}
             ]
         }
 
         self.groups = {}
         self.controls = {}
+        
+        # Assign group boxes to columns
+        left_groups = ["Basic Adjustments", "White Balance", "Noise Reduction", "Sharpening Settings", "Tone Mapping"]
+        right_groups = ["Fourier Settings", "RGB Gain Control", "Gamma Correction", "Lens Shading Correction", "Feature Extraction"]
+
         for group_name, controls in self.settings.items():
             group = QGroupBox(group_name)
-            group.setStyleSheet("QGroupBox::title { font-weight: bold; }")
+            group.setStyleSheet("""
+                QGroupBox { 
+                    border: 1px solid gray; 
+                    border-radius: 5px; 
+                    margin-top: 1ex; 
+                } 
+                QGroupBox::title { 
+                    subcontrol-origin: margin; 
+                    subcontrol-position: top left; 
+                    padding: 0 3px; 
+                }
+            """)
             layout = QVBoxLayout(group)
+            layout.setSpacing(10)
+            layout.setContentsMargins(10, 10, 10, 10)
             for control in controls:
                 if control["type"] == "slider":
                     initial_value = control.get("default", 0)
@@ -173,7 +359,9 @@ class MainWindow(QMainWindow):
                     widget.setFixedWidth(60)
                     widget.setToolTip(control.get("tooltip", ""))
                     spin_layout = QHBoxLayout()
-                    spin_layout.addWidget(QLabel(control["label"]))
+                    label = QLabel(control["label"])
+                    label.setFixedWidth(150)
+                    spin_layout.addWidget(label)
                     spin_layout.addWidget(widget)
                     spin_layout.addStretch()
                     layout.addLayout(spin_layout)
@@ -185,8 +373,12 @@ class MainWindow(QMainWindow):
                     layout.addWidget(widget)
                 self.controls[control["name"]] = widget
             self.groups[group_name] = group
-            self.scroll_layout.addWidget(group)
+            if group_name in left_groups:
+                left_column.addWidget(group)
+            else:
+                right_column.addWidget(group)
 
+        # Frequency layout
         self.freq_layout = QHBoxLayout()
         self.original_freq_vbox = QVBoxLayout()
         self.processed_freq_vbox = QVBoxLayout()
@@ -211,33 +403,83 @@ class MainWindow(QMainWindow):
         self.original_freq_cache = None
         self.current_image_path = None
 
-        # Debounce timer
-        self.timer = QTimer(self)
-        self.timer.setSingleShot(True)
-        self.timer.timeout.connect(self.apply_processing)
-
-        # Status bar for performance metrics
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
-        self.scroll_layout.addStretch()
+        main_layout.addStretch()
 
     def add_slider(self, layout, text, min_val, max_val, initial_value=0, enabled=False):
-        slider_layout = QVBoxLayout()
-        slider_layout.addWidget(QLabel(text))
+        slider_layout = QHBoxLayout()
+        label = QLabel(text)
+        label.setFixedWidth(150)
         slider = NoScrollSlider(Qt.Horizontal, minimum=min_val, maximum=max_val, enabled=enabled)
+        slider.setFixedWidth(250)
         slider.setValue(initial_value)
         value_label = QLabel(str(slider.value()))
+        value_label.setFixedWidth(50)
         slider.valueChanged.connect(lambda v: value_label.setText(str(v)))
         slider.valueChanged.connect(self.queue_processing)
+        slider_layout.addWidget(label)
         slider_layout.addWidget(slider)
         slider_layout.addWidget(value_label)
+        slider_layout.addStretch()
         layout.addLayout(slider_layout)
         return slider
 
     def queue_processing(self):
-        """Queue processing with a debounce delay."""
-        self.timer.start(5)  # 50ms debounce delay
+        if not hasattr(self, 'processing_thread') or not self.processing_thread.isRunning():
+            self.processing_thread = ProcessingThread(self, self.original_image, self.settings, self.controls)
+            self.processing_thread.result.connect(self.update_processed_image)
+            self.processing_thread.start()
+
+    def update_processed_image(self, result):
+        self.processed_image, keypoint_count, keypoint_strength, edge_density, elapsed = result
+        
+        # Handle Fourier display
+        if self.controls["fourier_checkbox"].isChecked():
+            inner = self.controls["fourier_inner_slider"].value()
+            outer = self.controls["fourier_outer_slider"].value()
+            if not self.freq_layout_added:
+                self.groups["Fourier Settings"].layout().addLayout(self.freq_layout)
+                self.freq_layout_added = True
+            
+            orig_freq = self.original_freq_cache
+            proc_freq = compute_frequency_image(self.processed_image, inner=inner, outer=outer)
+            display_size = 450
+            orig_pixmap = convert_cv_qt(orig_freq).scaled(display_size, display_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            proc_pixmap = convert_cv_qt(proc_freq).scaled(display_size, display_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            
+            self.original_freq_label.setPixmap(orig_pixmap)
+            self.processed_freq_label.setPixmap(proc_pixmap)
+            self.original_freq_title.setVisible(True)
+            self.processed_freq_title.setVisible(True)
+            self.original_freq_label.setVisible(True)
+            self.processed_freq_label.setVisible(True)
+            self.controls["fourier_inner_slider"].setEnabled(True)
+            self.controls["fourier_outer_slider"].setEnabled(True)
+        else:
+            if self.freq_layout_added:
+                self.groups["Fourier Settings"].layout().removeItem(self.freq_layout)
+                self.original_freq_title.setVisible(False)
+                self.processed_freq_title.setVisible(False)
+                self.original_freq_label.setVisible(False)
+                self.processed_freq_label.setVisible(False)
+                self.freq_layout_added = False
+            self.controls["fourier_inner_slider"].setValue(0)
+            self.controls["fourier_outer_slider"].setValue(0)
+            self.controls["fourier_inner_slider"].setEnabled(False)
+            self.controls["fourier_outer_slider"].setEnabled(False)
+
+        if self.image_window:
+            self.image_window.proc_pixmap = convert_cv_qt(self.processed_image)
+            self.image_window.processed_image = self.processed_image
+            self.image_window.resizeEvent(None)
+            self.image_window.proc_hist_label.setPixmap(generate_histogram(self.processed_image))
+        
+        self.status_bar.showMessage(
+            f"Processing time: {elapsed:.1f} ms | Keypoints: {keypoint_count} | "
+            f"Avg Strength: {keypoint_strength:.4f} | Edge Density: {edge_density:.1%}"
+        )
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -266,12 +508,12 @@ class MainWindow(QMainWindow):
             self.original_freq_cache = compute_frequency_image(self.original_image)
             self.apply_processing()
             if self.image_window is None:
-                print("Creating new ImageDisplayWindow")
                 self.image_window = ImageDisplayWindow(self.original_image, self.processed_image)
             else:
-                print("Reusing existing ImageDisplayWindow")
                 self.image_window.orig_pixmap = convert_cv_qt(self.original_image)
                 self.image_window.proc_pixmap = convert_cv_qt(self.processed_image)
+                self.image_window.original_image = self.original_image
+                self.image_window.processed_image = self.processed_image
                 self.image_window.resizeEvent(None)
             self.image_window.show()
             self.image_window.raise_()
@@ -297,20 +539,34 @@ class MainWindow(QMainWindow):
         with open(preset_path, 'w') as f:
             json.dump(preset, f)
         
-        # Show pop-up notification with auto-close
         msg = QMessageBox(self)
         msg.setWindowTitle("Preset Saved")
         msg.setText(f"Presets Saved Successfully!\nFile: {preset_path}")
         msg.setStandardButtons(QMessageBox.NoButton)
         
+        from PyQt5.QtCore import QTimer
         close_timer = QTimer(self)
         close_timer.setSingleShot(True)
         close_timer.timeout.connect(msg.accept)
-        close_timer.start(4000)  # 4000 ms = 4 seconds
+        close_timer.start(4000)
         
-        print("Showing QMessageBox")
         msg.exec_()
-        print("QMessageBox should have closed")
+
+    def save_image(self):
+        if self.processed_image is None:
+            self.status_bar.showMessage("No processed image to save.", 3000)
+            return
+        
+        fname, _ = QFileDialog.getSaveFileName(self, "Save Processed Image", "", "Image files (*.jpg *.png *.bmp)")
+        if fname:
+            try:
+                success = cv2.imwrite(fname, self.processed_image)
+                if success:
+                    self.status_bar.showMessage(f"Image saved successfully to {fname}", 3000)
+                else:
+                    self.status_bar.showMessage("Failed to save image.", 3000)   
+            except Exception as e:
+                self.status_bar.showMessage(f"Error saving image: {str(e)}", 3000)
 
     def load_preset(self):
         if self.original_image is None:
@@ -331,58 +587,11 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Preset loaded from {fname}", 3000)
 
     def apply_processing(self):
-        import time
-        start_time = time.time()
-        
-        if self.original_image is None:
-            return
-        self.processed_image = self.original_image.copy()
+        self.queue_processing()
 
-        for group_name, controls in self.settings.items():
-            for control in controls:
-                if "process" in control:
-                    widget = self.controls[control["name"]]
-                    value = widget.isChecked() if control["type"] == "checkbox" else widget.value()
-                    self.processed_image = control["process"](self.processed_image, value)
-
-        if self.controls["fourier_checkbox"].isChecked():
-            inner = self.controls["fourier_inner_slider"].value()
-            outer = self.controls["fourier_outer_slider"].value()
-            if not self.freq_layout_added:
-                self.groups["Fourier Settings"].layout().addLayout(self.freq_layout)
-                self.freq_layout_added = True
-            
-            orig_freq = self.original_freq_cache
-            proc_freq = compute_frequency_image(self.processed_image, inner=inner, outer=outer)
-            display_size = 500
-            orig_pixmap = convert_cv_qt(orig_freq).scaled(display_size, display_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            proc_pixmap = convert_cv_qt(proc_freq).scaled(display_size, display_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            
-            self.original_freq_label.setPixmap(orig_pixmap)
-            self.processed_freq_label.setPixmap(proc_pixmap)
-            self.original_freq_title.setVisible(True)
-            self.processed_freq_title.setVisible(True)
-            self.original_freq_label.setVisible(True)
-            self.processed_freq_label.setVisible(True)
-            self.controls["fourier_inner_slider"].setEnabled(True)
-            self.controls["fourier_outer_slider"].setEnabled(True)
-        else:
-            if self.freq_layout_added:
-                self.groups["Fourier Settings"].layout().removeItem(self.freq_layout)
-                self.original_freq_title.setVisible(False)
-                self.processed_freq_title.setVisible(False)
-                self.original_freq_label.setVisible(False)
-                self.processed_freq_label.setVisible(False)
-                self.freq_layout_added = False
-            self.controls["fourier_inner_slider"].setValue(0)
-            self.controls["fourier_outer_slider"].setValue(0)
-            self.controls["fourier_inner_slider"].setEnabled(False)
-            self.controls["fourier_outer_slider"].setEnabled(False)
-
-        if self.image_window:
-            self.image_window.proc_pixmap = convert_cv_qt(self.processed_image)
-            self.image_window.resizeEvent(None)
-            self.image_window.proc_hist_label.setPixmap(generate_histogram(self.processed_image))
-        
-        elapsed = (time.time() - start_time) * 1000  # ms
-        self.status_bar.showMessage(f"Processing time: {elapsed:.1f} ms")
+if __name__ == "__main__":
+    import sys
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
