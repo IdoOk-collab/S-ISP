@@ -1,0 +1,6 @@
+{
+    "libraries": [
+        "PyQt5",
+		"matplotlib"
+    ]
+}

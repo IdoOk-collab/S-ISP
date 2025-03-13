@@ -17,9 +17,9 @@ def resize_image_720p(img):
         raise ValueError("Input image is empty or invalid")
         
     h, w = img.shape[:2]
-    if h > 720:  # Downscale if height exceeds 720
-        scale = 720 / h
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    if max(h, w) > 720:
+        scale = 720 / max(h, w)
+        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
         h, w = img.shape[:2]
     return img, h, w 
 
@@ -61,24 +61,23 @@ def generate_histogram(image):
     return convert_cv_qt(hist_img)
 
 def compute_frequency_image(img, inner=None, outer=None):
-    """Compute a frequency domain visualization with optional black filter mask overlay."""
     if img is None or img.size == 0:
-        raise ValueError("Input image to compute_frequency_image is empty or invalid")
-        
-    img, h, w = resize_image_720p(img)
-    diagonal = int(np.ceil((w**2 + h**2)**0.5))
-    pad_y, pad_x = (diagonal - h) // 2, (diagonal - w) // 2
-    img_padded = cv2.copyMakeBorder(img, pad_y, diagonal - h - pad_y, pad_x, diagonal - w - pad_x, cv2.BORDER_REFLECT)
-    gray = cv2.cvtColor(img_padded, cv2.COLOR_BGR2GRAY)
+        raise ValueError("Input image is empty or invalid")
     
-    f = np.fft.fft2(gray)
-    fshift = np.fft.fftshift(f)
-    magnitude = 20 * np.log(np.abs(fshift) + 1)
-    if not np.all(np.isfinite(magnitude)):
-        magnitude[~np.isfinite(magnitude)] = 20 * np.log(np.finfo(np.float64).max)
+    # Downscale for consistency
+    img, h, w = resize_image_720p(img)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Use OpenCV's DFT
+    dft = cv2.dft(np.float32(gray), flags=cv2.DFT_COMPLEX_OUTPUT)
+    dft_shift = np.fft.fftshift(dft)  # Still use NumPy's fftshift for convenience
+    
+    # Compute magnitude spectrum
+    magnitude = 20 * np.log(cv2.magnitude(dft_shift[:,:,0], dft_shift[:,:,1]) + 1)
     magnitude = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
     magnitude_bgr = cv2.cvtColor(magnitude, cv2.COLOR_GRAY2BGR)
-
+    
+    # Additional logic for inner/outer (if applicable)
     if inner is not None and outer is not None:
         rows, cols = gray.shape
         crow, ccol = rows // 2, cols // 2
@@ -87,8 +86,8 @@ def compute_frequency_image(img, inner=None, outer=None):
         inner_r = inner * diagonal // 200 if inner != 0 else 0  # Start at center when inner = 0
         outer_r = outer * diagonal // 200
         
-        # Directly set ring pixels to black, including center when inner = 0
-        magnitude_bgr[(distances >= inner_r) & (distances <= outer_r)] = [0, 0, 0]
+        mask = (distances >= inner_r) & (distances <= outer_r)
+        magnitude_bgr[mask] = magnitude_bgr[mask] * 0.3  # 70% dimming instead of black
     
     return magnitude_bgr
 
@@ -103,45 +102,52 @@ def apply_fourier_filter(img, inner, outer):
     Returns:
         np.ndarray: Filtered image in BGR format with specified frequencies removed.
     """
-    if inner >= outer:  # Skip if invalid range
+    if inner >= outer:
         return img
-
+    
+    # Downscale for consistency
     img, h, w = resize_image_720p(img)
     
-    # Pad image to square with diagonal size for FFT
+    # Pad image
     diagonal = int(np.ceil((w**2 + h**2)**0.5))
     pad_y, pad_x = (diagonal - h) // 2, (diagonal - w) // 2
     img_padded = cv2.copyMakeBorder(img, pad_y, diagonal - h - pad_y, pad_x, diagonal - w - pad_x, cv2.BORDER_REFLECT)
     
-    # Convert to YCrCb and process luminance channel
+    # Convert to YCrCb and split channels
     ycrcb = cv2.cvtColor(img_padded, cv2.COLOR_BGR2YCrCb)
     y, cr, cb = cv2.split(ycrcb)
-    f = np.fft.fft2(np.float32(y))  # FFT on luminance
-    fshift = np.fft.fftshift(f)
     
-    # Create annular mask to filter frequencies
+    # Use OpenCV's DFT
+    dft = cv2.dft(np.float32(y), flags=cv2.DFT_COMPLEX_OUTPUT)
+    dft_shift = np.fft.fftshift(dft)
+    
+    # Create and apply mask
     rows, cols = y.shape
     crow, ccol = rows // 2, cols // 2
     distances = np.sqrt((np.arange(cols) - ccol)**2 + (np.arange(rows)[:, None] - crow)**2)
     inner_r, outer_r = inner * diagonal // 200, outer * diagonal // 200
-    mask = np.ones((rows, cols), np.float32)
-    mask[(distances >= inner_r) & (distances <= outer_r)] = 0  # Zero out band
+    mask = np.ones((rows, cols, 2), np.float32)
+    mask[(distances >= inner_r) & (distances <= outer_r), :] = 0
+    dft_shift *= mask
     
-    # Apply mask and inverse FFT
-    fshift *= mask
-    y_filtered = np.abs(np.fft.ifft2(np.fft.ifftshift(fshift)))
+    # Inverse DFT
+    f_ishift = np.fft.ifftshift(dft_shift)
+    y_filtered = cv2.idft(f_ishift)
+    y_filtered = cv2.magnitude(y_filtered[:,:,0], y_filtered[:,:,1])
     y_filtered = cv2.normalize(y_filtered, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
     
-    # Reconstruct and crop image
+    # Reconstruct and crop
     img_filtered = cv2.cvtColor(cv2.merge([y_filtered, cr, cb]), cv2.COLOR_YCrCb2BGR)
     img_filtered = img_filtered[pad_y:pad_y+h, pad_x:pad_x+w]
-    return cv2.resize(img_filtered, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+    return cv2.resize(img_filtered, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
     
 def apply_sharpening(slider, image):
     # Unsharp masking: sharpen by subtracting a blurred version
-    strength = slider * 0.05  # Scale 0-5
-    blurred = cv2.GaussianBlur(image, (5, 5), 1.0)  # Fixed kernel and sigma
-    sharpened_image = cv2.addWeighted(image, 1 + strength, blurred, -strength, 0)
+    edges = cv2.Canny(image, 100, 200)
+    edge_density = np.sum(edges > 0) / (image.shape[0] * image.shape[1])
+    sigma = 0.5 + edge_density  # Range 0.5 to 1.5
+    blurred = cv2.GaussianBlur(image, (3, 3), sigma)
+    sharpened_image = cv2.addWeighted(image, 1 + slider, blurred, -slider, 0)
     return sharpened_image
 
 def apply_lens_shading(strength, img):
@@ -219,7 +225,7 @@ def adjust_white_balance(img, temperature, tint):
     return cv2.merge(channels)
 
 def apply_noise_reduction(strength, img):
-    """Apply noise reduction using bilateral filtering.
+    """Apply noise reduction using fast NL means denoising with adaptive strength.
     
     Args:
         strength (float): Strength of noise reduction (0.0 to 1.0).
@@ -231,9 +237,12 @@ def apply_noise_reduction(strength, img):
     if strength <= 0:
         return img.copy()
     
-    # Bilateral filter: preserves edges while reducing noise
-    sigma = int(strength * 50)  # Scale strength to sigma values (0-50)
-    return cv2.bilateralFilter(img, d=9, sigmaColor=sigma, sigmaSpace=sigma)
+    downscaled, _, _ = resize_image_720p(img)
+    sigma = int(strength * 50)
+    denoised = cv2.bilateralFilter(downscaled, d=5, sigmaColor=sigma, sigmaSpace=sigma)
+    if downscaled.shape != img.shape:
+        denoised = cv2.resize(denoised, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
+    return denoised
     
 def apply_gamma_correction(gamma, img):
     """Apply gamma correction to adjust image brightness and contrast.
