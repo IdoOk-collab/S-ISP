@@ -16,7 +16,7 @@ import cv2
 import json
 import os
 import numpy as np
-from isp_processing import convert_cv_qt, generate_histogram, compute_frequency_image, apply_fourier_filter, apply_sharpening, adjust_rgb_gain, apply_lens_shading, adjust_white_balance, apply_noise_reduction, apply_gamma_correction, apply_tone_mapping, apply_edge_detection, apply_orb_keypoints
+from isp_processing import convert_cv_qt, generate_histogram, compute_frequency_image, apply_fourier_filter, apply_sharpening, adjust_rgb_gain, apply_lens_shading, adjust_white_balance, apply_noise_reduction, apply_gamma_correction, apply_tone_mapping, apply_edge_detection, apply_orb_keypoints, apply_clahe
 
 class NoScrollSlider(QSlider):
     def wheelEvent(self, event):
@@ -322,6 +322,13 @@ class MainWindow(QMainWindow):
                  "tooltip": "Overlays ORB keypoints to highlight distinctive features"},
                 {"type": "slider", "name": "keypoints_slider", "label": "Max Keypoints", "min": 100, "max": 1000, "default": 500,
                  "tooltip": "Controls the maximum number of keypoints detected"}
+            ],
+            "Local Contrast": [
+                {"type": "checkbox", "name": "clahe_checkbox", "label": "Enable CLAHE", 
+                 "process": lambda img, val: apply_clahe(img, val, self.controls["clahe_clip_slider"].value() / 10.0),
+                 "tooltip": "Enhances local contrast with CLAHE"},
+                {"type": "slider", "name": "clahe_clip_slider", "label": "CLAHE Clip Limit", "min": 0, "max": 40, "default": 20,
+                 "tooltip": "Controls contrast enhancement strength"}
             ]
         }
 

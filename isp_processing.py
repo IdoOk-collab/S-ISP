@@ -293,3 +293,13 @@ def apply_orb_keypoints(img, max_keypoints, apply=False):
     img_with_keypoints = cv2.drawKeypoints(img, keypoints, None, color=(0, 255, 0), flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
     avg_strength = sum(kp.response for kp in keypoints) / len(keypoints) if keypoints else 0.0
     return img_with_keypoints, len(keypoints), avg_strength
+    
+def apply_clahe(img, apply, clip_limit):
+    if not apply or clip_limit == 0:
+        return img.copy()
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge((l, a, b))
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
