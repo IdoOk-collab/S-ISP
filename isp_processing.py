@@ -66,28 +66,36 @@ def compute_frequency_image(img, inner=None, outer=None):
     
     # Downscale for consistency
     img, h, w = resize_image_720p(img)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    diagonal = int(np.ceil((w**2 + h**2)**0.5))
+    pad_y, pad_x = (diagonal - h) // 2, (diagonal - w) // 2
+    # Use constant padding (black) instead of reflect to avoid artifacts
+    img_padded = cv2.copyMakeBorder(img, pad_y, diagonal - h - pad_y, pad_x, diagonal - w - pad_x, cv2.BORDER_CONSTANT, value=0)
+    gray = cv2.cvtColor(img_padded, cv2.COLOR_BGR2GRAY)
     
     # Use OpenCV's DFT
     dft = cv2.dft(np.float32(gray), flags=cv2.DFT_COMPLEX_OUTPUT)
-    dft_shift = np.fft.fftshift(dft)  # Still use NumPy's fftshift for convenience
+    dft_shift = np.fft.fftshift(dft)  # Shift zero frequency to center
     
     # Compute magnitude spectrum
     magnitude = 20 * np.log(cv2.magnitude(dft_shift[:,:,0], dft_shift[:,:,1]) + 1)
     magnitude = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
     magnitude_bgr = cv2.cvtColor(magnitude, cv2.COLOR_GRAY2BGR)
     
-    # Additional logic for inner/outer (if applicable)
+    # Apply inner/outer filter if provided
     if inner is not None and outer is not None:
         rows, cols = gray.shape
         crow, ccol = rows // 2, cols // 2
-        distances = np.sqrt((np.arange(cols) - ccol)**2 + (np.arange(rows)[:, None] - crow)**2)
-        # Set minimum inner radius if needed, but include center when inner = 0
-        inner_r = inner * diagonal // 200 if inner != 0 else 0  # Start at center when inner = 0
+        # Create distance map from center
+        y, x = np.ogrid[:rows, :cols]
+        distances = np.sqrt((x - ccol)**2 + (y - crow)**2)
+        # Scale radii based on diagonal
+        inner_r = inner * diagonal // 200 if inner != 0 else 0  # Start at center if inner = 0
         outer_r = outer * diagonal // 200
         
+        # Create annular mask
         mask = (distances >= inner_r) & (distances <= outer_r)
-        magnitude_bgr[mask] = magnitude_bgr[mask] * 0.3  # 70% dimming instead of black
+        # Dim the selected region
+        magnitude_bgr[mask] = magnitude_bgr[mask] * 0.3  # 70% dimming
     
     return magnitude_bgr
 
@@ -111,7 +119,7 @@ def apply_fourier_filter(img, inner, outer):
     # Pad image
     diagonal = int(np.ceil((w**2 + h**2)**0.5))
     pad_y, pad_x = (diagonal - h) // 2, (diagonal - w) // 2
-    img_padded = cv2.copyMakeBorder(img, pad_y, diagonal - h - pad_y, pad_x, diagonal - w - pad_x, cv2.BORDER_REFLECT)
+    img_padded = cv2.copyMakeBorder(img, pad_y, diagonal - h - pad_y, pad_x, diagonal - w - pad_x, cv2.BORDER_CONSTANT)
     
     # Convert to YCrCb and split channels
     ycrcb = cv2.cvtColor(img_padded, cv2.COLOR_BGR2YCrCb)
